@@ -1,40 +1,65 @@
-import express from "express";
-import cors from "cors";
+// Single-bundle flag store that persists while the function stays warm
+const flags = globalThis._vfFlags || (globalThis._vfFlags = new Map());
 
-// In-memory store (resets when the function/container restarts).
-// For demos and simple use it's fine. For production, use Redis or a KV store.
-const flags = new Map();
+function json(res, code, obj) {
+  res.statusCode = code;
+  res.setHeader("Content-Type", "application/json");
+  res.setHeader("Cache-Control", "no-store");
+  res.end(JSON.stringify(obj));
+}
 
-const app = express();
-app.use(cors());
-app.use(express.json());
+export default async function handler(req, res) {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const path = url.pathname; // e.g., /api
+  const q = Object.fromEntries(url.searchParams.entries());
 
-// GET /vf/status?token=XYZ
-app.get("/vf/status", (req, res) => {
-  const token = String(req.query.token || "");
-  const entry = flags.get(token);
-  const show = !!(entry && entry.show && Date.now() < entry.expiresAt);
-  res.json({ show });
-});
+  // Parse JSON body if present
+  let body = {};
+  try {
+    if (req.method !== "GET" && req.headers["content-type"]?.includes("application/json")) {
+      const chunks = [];
+      for await (const ch of req) chunks.push(ch);
+      body = JSON.parse(Buffer.concat(chunks).toString() || "{}");
+    }
+  } catch { body = {}; }
 
-// POST /vf/toggle  { token: "...", action: "show", ttlSeconds?: 300 }
-app.post("/vf/toggle", (req, res) => {
-  const { token, action, ttlSeconds } = req.body || {};
-  if (!token || action !== "show") {
-    return res.status(400).json({ ok: false, error: "Missing token or invalid action" });
+  // Normalize inputs
+  const token = String(body.token || q.token || "").trim();
+  const action = String(body.action || q.action || "").toLowerCase();
+  const showFlag = action === "show" || String(body.show || q.show || "").toLowerCase() === "true";
+  const op = String(body.op || q.op || "").toLowerCase(); // optional: op=status|toggle|clear
+
+  // Route by op or action
+  // status
+  if (op === "status" || (req.method === "GET" && (q.status === "1" || q.status === "true"))) {
+    if (!token) return json(res, 400, { show: false, error: "Missing token" });
+    const entry = flags.get(token);
+    const show = !!(entry && entry.show && Date.now() < entry.expiresAt);
+    return json(res, 200, { show });
   }
-  const ttl = Number(ttlSeconds || 300); // default: 5 minutes
-  flags.set(String(token), { show: true, expiresAt: Date.now() + ttl * 1000 });
-  res.json({ ok: true });
-});
 
-// POST /vf/clear  { token: "..." }
-app.post("/vf/clear", (req, res) => {
-  const { token } = req.body || {};
-  if (!token) return res.status(400).json({ ok: false, error: "Missing token" });
-  flags.delete(String(token));
-  res.json({ ok: true });
-});
+  // toggle (show)
+  if (op === "toggle" || showFlag || (req.method === "POST" && action === "show")) {
+    if (!token) return json(res, 400, { ok: false, error: "Missing token" });
+    const ttl = Number(body.ttlSeconds || q.ttlSeconds || 300);
+    flags.set(token, { show: true, expiresAt: Date.now() + ttl * 1000 });
+    return json(res, 200, { ok: true });
+  }
 
-// Vercel serverless handler
-export default app;
+  // clear
+  if (op === "clear" || (req.method === "POST" && action === "clear")) {
+    if (!token) return json(res, 400, { ok: false, error: "Missing token" });
+    flags.delete(token);
+    return json(res, 200, { ok: true });
+  }
+
+  // Help message
+  return json(res, 200, {
+    ok: true,
+    usage: {
+      status: "GET /api?op=status&token=YOUR_TOKEN",
+      toggle: "POST /api { token, action:'show', ttlSeconds? }",
+      clear:  "POST /api { token, action:'clear' }"
+    }
+  });
+}
