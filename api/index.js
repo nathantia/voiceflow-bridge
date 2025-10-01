@@ -1,92 +1,79 @@
-// Single-bundle flag store that persists while the function stays warm
-const flags = globalThis._vfFlags || (globalThis._vfFlags = new Map());
-
-// Change this to lock down origins (recommended):
-const ALLOWED_ORIGINS = [
-  "https://dr-app-ae31e5.webflow.io",   // your Webflow site
-  // "https://your-custom-domain.com",   // add production domain(s) here later
-];
-// Fallback when origin doesn't match (you can set to "*" during testing)
-const FALLBACK_ORIGIN = "*";
-
-function cors(res, origin) {
-  res.setHeader("Access-Control-Allow-Origin", origin);
-  res.setHeader("Vary", "Origin");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  res.setHeader("Access-Control-Max-Age", "86400");
-}
-
-function json(res, code, obj, origin = FALLBACK_ORIGIN) {
-  cors(res, origin);
-  res.statusCode = code;
-  res.setHeader("Content-Type", "application/json");
-  res.setHeader("Cache-Control", "no-store");
-  res.end(JSON.stringify(obj));
-}
-
-export default async function handler(req, res) {
-  const origin = (req.headers.origin && ALLOWED_ORIGINS.includes(req.headers.origin))
-    ? req.headers.origin
-    : FALLBACK_ORIGIN;
-
-  // CORS preflight
-  if (req.method === "OPTIONS") {
-    cors(res, origin);
-    res.statusCode = 204;
-    return res.end();
+<style>
+  /* Hidden state */
+  [data-voiceflow-target="offer-banner"][data-visible="false"] { 
+    display: none !important;
   }
+  /* Visible state — force flex */
+  [data-voiceflow-target="offer-banner"][data-visible="true"] {
+    display: flex !important;
+    opacity: 1;
+    transition: opacity 200ms ease;
+  }
+  /* Start transparent */
+  [data-voiceflow-target="offer-banner"] { opacity: 0; }
+</style>
 
-  const url = new URL(req.url, `http://${req.headers.host}`);
-  const q = Object.fromEntries(url.searchParams.entries());
+<script>
+(function () {
+  // ===== CONFIG =====
+  var TARGET_VALUE = "offer-banner";                // must match attribute in Designer
+  var TOKEN = "site-default-token";                 // must match Voiceflow POST
+  var BASE  = "https://voiceflow-bridge.vercel.app";
+  var POLL_MS = 3000;
 
-  // Parse JSON body if present
-  let body = {};
-  try {
-    if (req.method !== "GET" && (req.headers["content-type"] || "").includes("application/json")) {
-      const chunks = [];
-      for await (const ch of req) chunks.push(ch);
-      body = JSON.parse(Buffer.concat(chunks).toString() || "{}");
+  // ===== RUNTIME =====
+  var STATUS_URL = BASE + "/api?op=status&token=" + encodeURIComponent(TOKEN);
+  var CLEAR_URL  = BASE + "/api?op=clear&token=" + encodeURIComponent(TOKEN);
+
+  function markHidden() {
+    var els = document.querySelectorAll('[data-voiceflow-target="' + TARGET_VALUE + '"]');
+    for (var i = 0; i < els.length; i++) {
+      els[i].setAttribute("data-visible", "false");
+      els[i].style.setProperty("display", "none", "important");
     }
-  } catch { body = {}; }
-
-  // Normalize inputs
-  const token = String(body.token || q.token || "").trim();
-  const action = String(body.action || q.action || "").toLowerCase();
-  const showFlag = action === "show" || String(body.show || q.show || "").toLowerCase() === "true";
-  const op = String(body.op || q.op || "").toLowerCase(); // op=status|toggle|clear
-  const originForResp = origin;
-
-  // STATUS
-  if (op === "status" || (req.method === "GET" && (q.status === "1" || q.status === "true"))) {
-    if (!token) return json(res, 400, { show: false, error: "Missing token" }, originForResp);
-    const entry = flags.get(token);
-    const show = !!(entry && entry.show && Date.now() < entry.expiresAt);
-    return json(res, 200, { show }, originForResp);
   }
 
-  // TOGGLE (SHOW)
-  if (op === "toggle" || showFlag || (req.method === "POST" && action === "show")) {
-    if (!token) return json(res, 400, { ok: false, error: "Missing token" }, originForResp);
-    const ttl = Number(body.ttlSeconds || q.ttlSeconds || 300);
-    flags.set(token, { show: true, expiresAt: Date.now() + ttl * 1000 });
-    return json(res, 200, { ok: true }, originForResp);
+  function setTextSafely(node, text) {
+    // basic sanitization: textContent avoids HTML injection
+    try { node.textContent = text == null ? "" : String(text); } catch(e) {}
   }
 
-  // CLEAR
-  if (op === "clear" || (req.method === "POST" && action === "clear")) {
-    if (!token) return json(res, 400, { ok: false, error: "Missing token" }, originForResp);
-    flags.delete(token);
-    return json(res, 200, { ok: true }, originForResp);
-  }
-
-  // HELP
-  return json(res, 200, {
-    ok: true,
-    usage: {
-      status: "GET /api?op=status&token=YOUR_TOKEN",
-      toggle: "POST /api { token, action:'show', ttlSeconds? }",
-      clear:  "POST /api { token, action:'clear' }"
+  function populateData(payload) {
+    if (!payload || typeof payload !== "object") return;
+    // first_name field(s)
+    var nameEls = document.querySelectorAll('[data-voiceflow-field="first_name"]');
+    for (var i = 0; i < nameEls.length; i++) {
+      setTextSafely(nameEls[i], payload.first_name || "");
     }
-  }, originForResp);
-}
+  }
+
+  function reveal() {
+    var els = document.querySelectorAll('[data-voiceflow-target="' + TARGET_VALUE + '"]');
+    for (var i = 0; i < els.length; i++) {
+      els[i].setAttribute("data-visible", "true");
+      els[i].style.setProperty("display", "flex", "important");
+      els[i].classList.remove("hidden");
+    }
+  }
+
+  markHidden();
+
+  var timer = setInterval(function () {
+    fetch(STATUS_URL, { cache: "no-store" })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (data) {
+        if (!data) return;
+        if (data.show === true) {
+          // inject dynamic fields first
+          populateData(data.data);
+          // then reveal UI
+          reveal();
+          clearInterval(timer);
+          // clear the flag so it doesn't retrigger
+          fetch(CLEAR_URL, { method: "GET", cache: "no-store" }).catch(function(){});
+        }
+      })
+      .catch(function () {});
+  }, POLL_MS);
+})();
+</script>
