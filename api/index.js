@@ -1,79 +1,91 @@
-<style>
-  /* Hidden state */
-  [data-voiceflow-target="offer-banner"][data-visible="false"] { 
-    display: none !important;
+// Single-bundle store (persists while function stays warm)
+const flags = globalThis._vfFlags || (globalThis._vfFlags = new Map());
+
+// Allow your domains (tighten for production)
+const ALLOWED_ORIGINS = [
+  "https://dr-app-ae31e5.webflow.io",
+];
+const FALLBACK_ORIGIN = "*";
+
+function cors(res, origin) {
+  res.setHeader("Access-Control-Allow-Origin", origin);
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Max-Age", "86400");
+}
+
+function json(res, code, obj, origin = FALLBACK_ORIGIN) {
+  cors(res, origin);
+  res.statusCode = code;
+  res.setHeader("Content-Type", "application/json");
+  res.setHeader("Cache-Control", "no-store");
+  res.end(JSON.stringify(obj));
+}
+
+export default async function handler(req, res) {
+  const origin = (req.headers.origin && ALLOWED_ORIGINS.includes(req.headers.origin))
+    ? req.headers.origin
+    : FALLBACK_ORIGIN;
+
+  // CORS preflight
+  if (req.method === "OPTIONS") {
+    cors(res, origin);
+    res.statusCode = 204;
+    return res.end();
   }
-  /* Visible state — force flex */
-  [data-voiceflow-target="offer-banner"][data-visible="true"] {
-    display: flex !important;
-    opacity: 1;
-    transition: opacity 200ms ease;
-  }
-  /* Start transparent */
-  [data-voiceflow-target="offer-banner"] { opacity: 0; }
-</style>
 
-<script>
-(function () {
-  // ===== CONFIG =====
-  var TARGET_VALUE = "offer-banner";                // must match attribute in Designer
-  var TOKEN = "site-default-token";                 // must match Voiceflow POST
-  var BASE  = "https://voiceflow-bridge.vercel.app";
-  var POLL_MS = 3000;
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const q = Object.fromEntries(url.searchParams.entries());
 
-  // ===== RUNTIME =====
-  var STATUS_URL = BASE + "/api?op=status&token=" + encodeURIComponent(TOKEN);
-  var CLEAR_URL  = BASE + "/api?op=clear&token=" + encodeURIComponent(TOKEN);
-
-  function markHidden() {
-    var els = document.querySelectorAll('[data-voiceflow-target="' + TARGET_VALUE + '"]');
-    for (var i = 0; i < els.length; i++) {
-      els[i].setAttribute("data-visible", "false");
-      els[i].style.setProperty("display", "none", "important");
+  // Parse JSON body if present
+  let body = {};
+  try {
+    if (req.method !== "GET" && (req.headers["content-type"] || "").includes("application/json")) {
+      const chunks = [];
+      for await (const ch of req) chunks.push(ch);
+      body = JSON.parse(Buffer.concat(chunks).toString() || "{}");
     }
+  } catch { body = {}; }
+
+  // Inputs
+  const token = String(body.token || q.token || "").trim();
+  const action = String(body.action || q.action || "").toLowerCase();
+  const op = String(body.op || q.op || "").toLowerCase();
+  const showFlag = action === "show" || String(body.show || q.show || "").toLowerCase() === "true";
+  const payload = (body.data && typeof body.data === "object") ? body.data : undefined;
+
+  // STATUS
+  if (op === "status" || (req.method === "GET" && (q.status === "1" || q.status === "true"))) {
+    if (!token) return json(res, 400, { show: false, error: "Missing token" }, origin);
+    const entry = flags.get(token);
+    const show = !!(entry && entry.show && Date.now() < entry.expiresAt);
+    // return the stored payload if available and not expired
+    return json(res, 200, { show, data: show && entry?.data ? entry.data : undefined }, origin);
   }
 
-  function setTextSafely(node, text) {
-    // basic sanitization: textContent avoids HTML injection
-    try { node.textContent = text == null ? "" : String(text); } catch(e) {}
+  // TOGGLE (SHOW)
+  if (op === "toggle" || showFlag || (req.method === "POST" && action === "show")) {
+    if (!token) return json(res, 400, { ok: false, error: "Missing token" }, origin);
+    const ttl = Number(body.ttlSeconds || q.ttlSeconds || 300);
+    flags.set(token, { show: true, data: payload, expiresAt: Date.now() + ttl * 1000 });
+    return json(res, 200, { ok: true }, origin);
   }
 
-  function populateData(payload) {
-    if (!payload || typeof payload !== "object") return;
-    // first_name field(s)
-    var nameEls = document.querySelectorAll('[data-voiceflow-field="first_name"]');
-    for (var i = 0; i < nameEls.length; i++) {
-      setTextSafely(nameEls[i], payload.first_name || "");
+  // CLEAR
+  if (op === "clear" || (req.method === "POST" && action === "clear")) {
+    if (!token) return json(res, 400, { ok: false, error: "Missing token" }, origin);
+    flags.delete(token);
+    return json(res, 200, { ok: true }, origin);
+  }
+
+  // HELP
+  return json(res, 200, {
+    ok: true,
+    usage: {
+      status: "GET /api?op=status&token=YOUR_TOKEN",
+      toggle: "POST /api { token, action:'show', ttlSeconds?, data? }",
+      clear:  "POST /api { token, action:'clear' }"
     }
-  }
-
-  function reveal() {
-    var els = document.querySelectorAll('[data-voiceflow-target="' + TARGET_VALUE + '"]');
-    for (var i = 0; i < els.length; i++) {
-      els[i].setAttribute("data-visible", "true");
-      els[i].style.setProperty("display", "flex", "important");
-      els[i].classList.remove("hidden");
-    }
-  }
-
-  markHidden();
-
-  var timer = setInterval(function () {
-    fetch(STATUS_URL, { cache: "no-store" })
-      .then(function (r) { return r.ok ? r.json() : null; })
-      .then(function (data) {
-        if (!data) return;
-        if (data.show === true) {
-          // inject dynamic fields first
-          populateData(data.data);
-          // then reveal UI
-          reveal();
-          clearInterval(timer);
-          // clear the flag so it doesn't retrigger
-          fetch(CLEAR_URL, { method: "GET", cache: "no-store" }).catch(function(){});
-        }
-      })
-      .catch(function () {});
-  }, POLL_MS);
-})();
-</script>
+  }, origin);
+}
